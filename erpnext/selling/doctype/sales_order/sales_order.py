@@ -111,14 +111,14 @@ class SalesOrder(SellingController):
 
 	def validate_warehouse(self):
 		super(SalesOrder, self).validate_warehouse()
-		
+
 		for d in self.get("items"):
 			if (frappe.db.get_value("Item", d.item_code, "is_stock_item")==1 or
 				(self.has_product_bundle(d.item_code) and self.product_bundle_has_stock_item(d.item_code))) \
 				and not d.warehouse and not cint(d.delivered_by_supplier):
 				frappe.throw(_("Delivery warehouse required for stock item {0}").format(d.item_code),
 					WarehouseRequired)
-			
+
 	def validate_with_previous_doc(self):
 		super(SalesOrder, self).validate_with_previous_doc({
 			"Quotation": {
@@ -285,14 +285,29 @@ class SalesOrder(SellingController):
 
 			delivered_qty += item.delivered_qty
 			tot_qty += item.qty
-			
-		frappe.db.set_value("Sales Order", self.name, "per_delivered", flt(delivered_qty/tot_qty) * 100, 
-		update_modified=False)
 
+		frappe.db.set_value("Sales Order", self.name, "per_delivered", flt(delivered_qty/tot_qty) * 100,
+		update_modified=False)
+	
+	def set_indicator(self):
+		"""Set indicator for portal"""
+		if self.per_billed < 100 and self.per_delivered < 100:
+			self.indicator_color = "orange"
+			self.indicator_title = _("Not Paid and Not Delivered")
+		
+		elif self.per_billed == 100 and self.per_delivered < 100:
+			self.indicator_color = "orange"
+			self.indicator_title = _("Paid and Not Delivered")
+
+		else:
+			self.indicator_color = "green"
+			self.indicator_title = _("Paid")
+			
 def get_list_context(context=None):
 	from erpnext.controllers.website_list_for_contact import get_list_context
 	list_context = get_list_context(context)
 	list_context["title"] = _("My Orders")
+	list_context["parents"] = [{"title": _("My Account"), "name": "me"}]
 	return list_context
 
 @frappe.whitelist()
@@ -401,7 +416,7 @@ def make_delivery_note(source_name, target_doc=None):
 	return target_doc
 
 @frappe.whitelist()
-def make_sales_invoice(source_name, target_doc=None):
+def make_sales_invoice(source_name, target_doc=None, ignore_permissions=False):
 	def postprocess(source, target):
 		set_missing_values(source, target)
 		#Get the advance paid Journal Entries in Sales Invoice Advance
@@ -410,6 +425,7 @@ def make_sales_invoice(source_name, target_doc=None):
 	def set_missing_values(source, target):
 		target.is_pos = 0
 		target.ignore_pricing_rule = 1
+		target.flags.ignore_permissions = True
 		target.run_method("set_missing_values")
 		target.run_method("calculate_taxes_and_totals")
 
@@ -442,7 +458,7 @@ def make_sales_invoice(source_name, target_doc=None):
 			"doctype": "Sales Team",
 			"add_if_empty": True
 		}
-	}, target_doc, postprocess)
+	}, target_doc, postprocess, ignore_permissions=ignore_permissions)
 
 	return doclist
 
@@ -518,7 +534,9 @@ def get_events(start, end, filters=None):
 	data = frappe.db.sql("""select name, customer_name, delivery_status, billing_status, delivery_date
 		from `tabSales Order`
 		where (ifnull(delivery_date, '0000-00-00')!= '0000-00-00') \
-				and (delivery_date between %(start)s and %(end)s) {conditions}
+				and (delivery_date between %(start)s and %(end)s)
+				and docstatus < 2
+				{conditions}
 		""".format(conditions=conditions), {
 			"start": start,
 			"end": end
@@ -533,7 +551,7 @@ def make_purchase_order_for_drop_shipment(source_name, for_supplier, target_doc=
 		default_price_list = frappe.get_value("Supplier", for_supplier, "default_price_list")
 		if default_price_list:
 			target.buying_price_list = default_price_list
-		
+
 		if any( item.delivered_by_supplier==1 for item in source.items):
 			if source.shipping_address_name:
 				target.customer_address = source.shipping_address_name
@@ -541,12 +559,12 @@ def make_purchase_order_for_drop_shipment(source_name, for_supplier, target_doc=
 			else:
 				target.customer_address = source.customer_address
 				target.customer_address_display = source.address_display
-			
+
 			target.customer_contact_person = source.contact_person
 			target.customer_contact_display = source.contact_display
 			target.customer_contact_mobile = source.contact_mobile
 			target.customer_contact_email = source.contact_email
-			
+
 		else:
 			target.customer = ""
 			target.customer_name = ""

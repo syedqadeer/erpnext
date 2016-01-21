@@ -105,6 +105,12 @@ class JournalEntry(AccountsController):
 					elif d.reference_type in ("Sales Order", "Purchase Order") and d.is_advance != "Yes":
 						frappe.throw(_("Row {0}: Payment against Sales/Purchase Order should always be marked as advance").format(d.idx))
 
+				if d.is_advance == "Yes":
+					if d.party_type == 'Customer' and flt(d.debit) > 0:
+						frappe.throw(_("Row {0}: Advance against Customer must be credit").format(d.idx))
+					elif d.party_type == 'Supplier' and flt(d.credit) > 0:
+						frappe.throw(_("Row {0}: Advance against Supplier must be debit").format(d.idx))
+
 	def validate_against_jv(self):
 		for d in self.get('accounts'):
 			if d.reference_type=="Journal Entry":
@@ -274,10 +280,14 @@ class JournalEntry(AccountsController):
 		alternate_currency = []
 		for d in self.get("accounts"):
 			account = frappe.db.get_value("Account", d.account, ["account_currency", "account_type"], as_dict=1)
-			d.account_currency = account.account_currency or self.company_currency
-			d.account_type = account.account_type
+			if account:
+				d.account_currency = account.account_currency
+				d.account_type = account.account_type
 
-			if d.account_currency!=self.company_currency and d.account_currency not in alternate_currency:
+			if not d.account_currency:
+				d.account_currency = self.company_currency
+
+			if d.account_currency != self.company_currency and d.account_currency not in alternate_currency:
 				alternate_currency.append(d.account_currency)
 
 		if alternate_currency:
@@ -341,6 +351,7 @@ class JournalEntry(AccountsController):
 	def set_print_format_fields(self):
 		total_amount = 0.0
 		bank_account_currency = None
+		self.pay_to_recd_from = None
 		for d in self.get('accounts'):
 			if d.party_type and d.party:
 				if not self.pay_to_recd_from:
@@ -350,7 +361,10 @@ class JournalEntry(AccountsController):
 			elif frappe.db.get_value("Account", d.account, "account_type") in ["Bank", "Cash"]:
 				total_amount += (d.debit_in_account_currency or d.credit_in_account_currency)
 				bank_account_currency = d.account_currency
-
+		
+		if not self.pay_to_recd_from:
+			total_amount = 0
+		
 		self.set_total_amount(total_amount, bank_account_currency)
 
 	def set_total_amount(self, amt, currency):
@@ -498,7 +512,7 @@ class JournalEntry(AccountsController):
 			d.party_balance = party_balance[(d.party_type, d.party)]
 
 @frappe.whitelist()
-def get_default_bank_cash_account(company, voucher_type, mode_of_payment=None):
+def get_default_bank_cash_account(company, voucher_type, mode_of_payment=None, account=None):
 	from erpnext.accounts.doctype.sales_invoice.sales_invoice import get_bank_cash_account
 	if mode_of_payment:
 		account = get_bank_cash_account(mode_of_payment, company)
@@ -506,16 +520,18 @@ def get_default_bank_cash_account(company, voucher_type, mode_of_payment=None):
 			account.update({"balance": get_balance_on(account.get("account"))})
 			return account
 
-	if voucher_type=="Bank Entry":
-		account = frappe.db.get_value("Company", company, "default_bank_account")
-		if not account:
-			account = frappe.db.get_value("Account",
-				{"company": company, "account_type": "Bank", "is_group": 0})
-	elif voucher_type=="Cash Entry":
-		account = frappe.db.get_value("Company", company, "default_cash_account")
-		if not account:
-			account = frappe.db.get_value("Account",
-				{"company": company, "account_type": "Cash", "is_group": 0})
+	if not account:
+		if voucher_type=="Bank Entry":
+			account = frappe.db.get_value("Company", company, "default_bank_account")
+			if not account:
+				account = frappe.db.get_value("Account",
+					{"company": company, "account_type": "Bank", "is_group": 0})
+				
+		elif voucher_type=="Cash Entry":
+			account = frappe.db.get_value("Company", company, "default_cash_account")
+			if not account:
+				account = frappe.db.get_value("Account",
+					{"company": company, "account_type": "Cash", "is_group": 0})
 
 	if account:
 		account_details = frappe.db.get_value("Account", account,
@@ -528,7 +544,7 @@ def get_default_bank_cash_account(company, voucher_type, mode_of_payment=None):
 		}
 
 @frappe.whitelist()
-def get_payment_entry_against_order(dt, dn):
+def get_payment_entry_against_order(dt, dn, amount=None, journal_entry=False, bank_account=None):
 	ref_doc = frappe.get_doc(dt, dn)
 
 	if flt(ref_doc.per_billed, 2) > 0:
@@ -546,10 +562,11 @@ def get_payment_entry_against_order(dt, dn):
 	party_account = get_party_account(party_type, ref_doc.get(party_type.lower()), ref_doc.company)
 	party_account_currency = get_account_currency(party_account)
 
-	if party_account_currency == ref_doc.company_currency:
-		amount = flt(ref_doc.base_grand_total) - flt(ref_doc.advance_paid)
-	else:
-		amount = flt(ref_doc.grand_total) - flt(ref_doc.advance_paid)
+	if not amount:
+		if party_account_currency == ref_doc.company_currency:
+			amount = flt(ref_doc.base_grand_total) - flt(ref_doc.advance_paid)
+		else:
+			amount = flt(ref_doc.grand_total) - flt(ref_doc.advance_paid)
 
 	return get_payment_entry(ref_doc, {
 		"party_type": party_type,
@@ -559,11 +576,13 @@ def get_payment_entry_against_order(dt, dn):
 		"amount_field_bank": amount_field_bank,
 		"amount": amount,
 		"remarks": 'Advance Payment received against {0} {1}'.format(dt, dn),
-		"is_advance": "Yes"
+		"is_advance": "Yes",
+		"bank_account": bank_account,
+		"journal_entry": journal_entry
 	})
 
 @frappe.whitelist()
-def get_payment_entry_against_invoice(dt, dn):
+def get_payment_entry_against_invoice(dt, dn, amount=None, journal_entry=False, bank_account=None):
 	ref_doc = frappe.get_doc(dt, dn)
 	if dt == "Sales Invoice":
 		party_type = "Customer"
@@ -587,24 +606,28 @@ def get_payment_entry_against_invoice(dt, dn):
 		"party_account_currency": ref_doc.party_account_currency,
 		"amount_field_party": amount_field_party,
 		"amount_field_bank": amount_field_bank,
-		"amount": abs(ref_doc.outstanding_amount),
+		"amount": amount if amount else abs(ref_doc.outstanding_amount),
 		"remarks": 'Payment received against {0} {1}. {2}'.format(dt, dn, ref_doc.remarks),
-		"is_advance": "No"
+		"is_advance": "No",
+		"bank_account": bank_account,
+		"journal_entry": journal_entry
 	})
 
 def get_payment_entry(ref_doc, args):
 	cost_center = frappe.db.get_value("Company", ref_doc.company, "cost_center")
-	exchange_rate = get_exchange_rate(args.get("party_account"), args.get("party_account_currency"),
-		ref_doc.company, ref_doc.doctype, ref_doc.name)
+	exchange_rate = 1
+	if args.get("party_account"):
+		exchange_rate = get_exchange_rate(args.get("party_account"), args.get("party_account_currency"),
+			ref_doc.company, ref_doc.doctype, ref_doc.name)
 
-	jv = frappe.new_doc("Journal Entry")
-	jv.update({
+	je = frappe.new_doc("Journal Entry")
+	je.update({
 		"voucher_type": "Bank Entry",
 		"company": ref_doc.company,
 		"remark": args.get("remarks")
 	})
 
-	party_row = jv.append("accounts", {
+	party_row = je.append("accounts", {
 		"account": args.get("party_account"),
 		"party_type": args.get("party_type"),
 		"party": ref_doc.get(args.get("party_type").lower()),
@@ -621,8 +644,10 @@ def get_payment_entry(ref_doc, args):
 		"reference_name": ref_doc.name
 	})
 
-	bank_row = jv.append("accounts")
-	bank_account = get_default_bank_cash_account(ref_doc.company, "Bank Entry")
+	bank_row = je.append("accounts")
+	
+	#make it bank_details
+	bank_account = get_default_bank_cash_account(ref_doc.company, "Bank Entry", account=args.get("bank_account"))
 	if bank_account:
 		bank_row.update(bank_account)
 		bank_row.exchange_rate = get_exchange_rate(bank_account["account"],
@@ -638,12 +663,12 @@ def get_payment_entry(ref_doc, args):
 	# set multi currency check
 	if party_row.account_currency != ref_doc.company_currency \
 		or (bank_row.account_currency and bank_row.account_currency != ref_doc.company_currency):
-			jv.multi_currency = 1
+			je.multi_currency = 1
 
-	jv.set_amounts_in_company_currency()
-	jv.set_total_debit_credit()
-
-	return jv.as_dict()
+	je.set_amounts_in_company_currency()
+	je.set_total_debit_credit()
+	
+	return je if args.get("journal_entry") else je.as_dict()
 
 @frappe.whitelist()
 def get_opening_accounts(company):
